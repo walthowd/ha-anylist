@@ -1411,6 +1411,15 @@ class AnyListClient:
         """Prevent queued executor work from starting requests after unload."""
         self._closed = True
 
+    def realtime_credentials(self) -> tuple[str, str]:
+        """Client identifier and current access token for the realtime listener."""
+        return self._client_identifier, self._access_token
+
+    @_serialized
+    def refresh_access_token(self) -> None:
+        """Refresh the access token (the realtime socket closed with 4010)."""
+        self._refresh_tokens()
+
     @_serialized
     def request_refresh(self) -> None:
         """Make the next read of each loaded resource revalidate its snapshot."""
