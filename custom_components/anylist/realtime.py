@@ -78,11 +78,13 @@ class AnyListRealtime:
         client: AnyListClient,
         session: aiohttp.ClientSession,
         on_change: Callable[[frozenset[str], bool], Awaitable[None]],
+        on_connected: Callable[[bool], None] | None = None,
     ) -> None:
         self._hass = hass
         self._client = client
         self._session = session
         self._on_change = on_change
+        self._on_connected = on_connected
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._retry_delay = INITIAL_RETRY_DELAY
@@ -112,7 +114,18 @@ class AnyListRealtime:
         self._task = self._flush = None
         self._pending.clear()
         self._pending_coordinator = False
-        self.connected = False
+        self._set_connected(False)
+
+    def _set_connected(self, connected: bool) -> None:
+        """Record the socket state and report changes to the owner."""
+        if connected == self.connected:
+            return
+        self.connected = connected
+        if self._on_connected is not None:
+            try:
+                self._on_connected(connected)
+            except Exception as err:  # noqa: BLE001 - never let the listener die
+                _LOGGER.warning("AnyList realtime state callback failed: %s", err)
 
     def diagnostics(self) -> dict:
         """Connection state for diagnostics."""
@@ -136,7 +149,7 @@ class AnyListRealtime:
                 raise
             except Exception as err:  # noqa: BLE001 - never let the listener die
                 _LOGGER.warning("AnyList realtime listener error: %s", safe_error(err))
-            self.connected = False
+            self._set_connected(False)
             if self._stop.is_set():
                 return
             stable = self._hass.loop.time() - started >= STABLE_AFTER
@@ -184,8 +197,8 @@ class AnyListRealtime:
         async with asyncio.timeout(CONNECT_TIMEOUT):
             ws = await self._session.ws_connect(url, heartbeat=None)
         async with ws:
-            self.connected = True
             self.connects += 1
+            self._set_connected(True)
             if self.connects == 1:
                 _LOGGER.info("AnyList realtime connected: changes from the AnyList apps now refresh at once")
             else:

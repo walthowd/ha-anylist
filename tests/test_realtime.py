@@ -253,3 +253,32 @@ async def test_backoff_when_unreachable(hass):
     await asyncio.sleep(0.5)
     await asyncio.wait_for(listener.stop(), 2)
     assert 2 <= len(session.urls) < 8  # 50, 100, 200 ms ... not a tight loop
+
+
+async def test_reports_connection_state_changes(hass):
+    """The owner hears each up/down transition once, including on stop."""
+    states: list[bool] = []
+    sockets = iter([FakeWS({"on_open": [CLOSE]}), FakeWS()])
+    session = Session(lambda n: next(sockets, FakeWS()))
+    listener = rt.AnyListRealtime(hass, FakeClient(), session, Recorder(), states.append)
+    listener.start()
+    await until(lambda: len(session.urls) >= 2 and listener.connected)
+    assert states == [True, False, True]
+    await listener.stop()
+    assert states == [True, False, True, False]
+    assert not listener.connected
+
+
+async def test_state_callback_error_does_not_kill_socket(hass):
+    """A failing owner callback is logged, not fatal."""
+
+    def boom(_connected):
+        raise RuntimeError("boom")
+
+    rec = Recorder()
+    session = Session(lambda n: FakeWS({"on_open": [text("refresh-shopping-lists")]}))
+    listener = rt.AnyListRealtime(hass, FakeClient(), session, rec, boom)
+    listener.start()
+    await asyncio.wait_for(rec.event.wait(), 3)
+    assert listener.connected
+    await listener.stop()

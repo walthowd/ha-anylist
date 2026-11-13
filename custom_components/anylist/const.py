@@ -21,6 +21,8 @@ ANYLIST_PHOTO_TIMEOUT = 65  # upload, token refresh, and image processing
 ANYLIST_DEFAULT_POLL_INTERVAL = 60  # seconds, default when no option is configured
 ANYLIST_MIN_POLL_INTERVAL = 60  # seconds
 ANYLIST_MAX_POLL_INTERVAL = 3600  # seconds
+# Backstop poll while the realtime socket is up (it pushes every change).
+REALTIME_BACKSTOP_INTERVAL = 3600  # seconds
 
 # Services
 SERVICE_REFRESH = "refresh"

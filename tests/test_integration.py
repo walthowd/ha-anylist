@@ -15,7 +15,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.anylist import (
     AnyListRuntimeData,
@@ -159,6 +160,57 @@ async def test_setup_entry_uses_configured_poll_interval(
         await hass.async_block_till_done()
 
     assert entry.runtime_data.coordinator.update_interval == timedelta(seconds=300)
+
+
+async def test_realtime_socket_pauses_and_resumes_polling(
+    hass: HomeAssistant,
+) -> None:
+    """While the socket is up polling is an hourly backstop; a drop restores it."""
+    entry = _mock_entry(
+        options={
+            CONF_SELECTED_LISTS: ["list-1"],
+            CONF_MEAL_PLAN_CALENDAR: False,
+            CONF_POLL_INTERVAL: 300,
+        }
+    )
+    entry.add_to_hass(hass)
+    client = FakeAnyListClient(lists=[fake_list("list-1", "Groceries")])
+
+    with patch(
+        "custom_components.anylist.AnyListClient.login",
+        return_value=client,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    runtime = entry.runtime_data
+    coordinator = runtime.coordinator
+    report = runtime.realtime._on_connected
+
+    report(True)
+    assert coordinator.update_interval == timedelta(seconds=3600)
+
+    report(False)
+    assert coordinator.update_interval == timedelta(seconds=300)
+    with patch.object(coordinator, "async_request_refresh") as refresh:
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=299))
+        await hass.async_block_till_done()
+        refresh.assert_not_called()
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+        await hass.async_block_till_done()
+        refresh.assert_called_once()
+
+    # A reconnect before the resume poll cancels it.
+    report(False)
+    report(True)
+    assert coordinator.update_interval == timedelta(seconds=3600)
+    with patch.object(coordinator, "async_request_refresh") as refresh:
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+        await hass.async_block_till_done()
+        refresh.assert_not_called()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 async def test_setup_entry_defaults_poll_interval(hass: HomeAssistant) -> None:
@@ -859,3 +911,108 @@ async def test_fetch_data_timeout_raises_update_failed(
 
     with pytest.raises(UpdateFailed):
         await _async_fetch_data(hass, client)
+
+
+def _next_poll(hass: HomeAssistant, coordinator) -> int | None:
+    """Seconds until the coordinator's pending timer, or None."""
+    if coordinator._unsub_refresh is None:
+        return None
+    return round(coordinator._unsub_refresh.__self__.when() - hass.loop.time())
+
+
+async def _setup_realtime_entry(hass: HomeAssistant, *, disable_polling: bool = False):
+    entry = _mock_entry(
+        options={
+            CONF_SELECTED_LISTS: ["list-1"],
+            CONF_MEAL_PLAN_CALENDAR: False,
+            CONF_POLL_INTERVAL: 300,
+        },
+    )
+    entry.add_to_hass(hass)
+    if disable_polling:
+        hass.config_entries.async_update_entry(entry, pref_disable_polling=True)
+    client = FakeAnyListClient(lists=[fake_list("list-1", "Groceries")])
+    client.mark_stale = lambda names: None
+    with patch(
+        "custom_components.anylist.AnyListClient.login",
+        return_value=client,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry, client
+
+
+def _polls(client) -> int:
+    return sum(1 for call in client.calls if call[0] == "get_lists")
+
+
+async def test_realtime_moves_the_real_poll_timer(hass: HomeAssistant) -> None:
+    """Connected: the next poll is an hour out. Dropped: one poll at +300 s."""
+    entry, client = await _setup_realtime_entry(hass)
+    coordinator = entry.runtime_data.coordinator
+    realtime = entry.runtime_data.realtime
+
+    realtime._on_connected(True)
+    await coordinator.async_refresh()
+    assert abs(_next_poll(hass, coordinator) - 3600) <= 1
+
+    realtime._on_connected(False)
+    before = _polls(client)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+    await hass.async_block_till_done()
+    assert _polls(client) - before == 1
+    assert abs(_next_poll(hass, coordinator) - 300) <= 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_failed_refresh_while_connected_retries_at_poll_interval(
+    hass: HomeAssistant,
+) -> None:
+    """A failure while the socket is up retries in 300 s, not an hour."""
+    entry, client = await _setup_realtime_entry(hass)
+    coordinator = entry.runtime_data.coordinator
+    realtime = entry.runtime_data.realtime
+    realtime._on_connected(True)
+
+    def boom():
+        raise RuntimeError("net down")
+
+    client.get_lists = boom
+    await realtime._on_change(frozenset({"lists"}), True)
+    await hass.async_block_till_done()
+    assert not coordinator.last_update_success
+    assert abs(_next_poll(hass, coordinator) - 300) <= 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_unload_while_connected_leaves_no_poll(hass: HomeAssistant) -> None:
+    """stop() reports a drop during unload; its resume timer must not fire."""
+    entry, client = await _setup_realtime_entry(hass)
+    realtime = entry.runtime_data.realtime
+    realtime.connected = True
+    realtime._on_connected(True)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    before = _polls(client)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=4000))
+    await hass.async_block_till_done()
+    assert _polls(client) == before
+
+
+async def test_drop_does_not_poll_when_polling_disabled(hass: HomeAssistant) -> None:
+    """With system polling off for the entry, a socket drop adds no poll."""
+    entry, client = await _setup_realtime_entry(hass, disable_polling=True)
+    realtime = entry.runtime_data.realtime
+    realtime._on_connected(True)
+    realtime._on_connected(False)
+    before = _polls(client)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=301))
+    await hass.async_block_till_done()
+    assert _polls(client) == before
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()

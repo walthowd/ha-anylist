@@ -646,7 +646,7 @@ feature, so tag fields and filters are unavailable.
 
 - This is an unofficial integration and AnyList does not publish a public API.
 - The local client implements only the AnyList API subset needed by this integration.
-- Realtime websocket sync is intentionally disabled; polling is the reliable update path.
+- Realtime push (the WebSocket the AnyList apps use) refreshes changes within a second or two. While it is connected, polling drops to an hourly backstop; when it drops, the configured poll interval returns.
 - The integration supports AnyList cloud accounts, not local devices.
 - Recipe import from external websites is not implemented.
 - Items can be reordered by dragging them in the Home Assistant to-do list, but not from automations: Home Assistant has no action for moving a to-do item.

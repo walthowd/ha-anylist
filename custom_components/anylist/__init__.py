@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
@@ -12,7 +13,9 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import (
+    HassJob,
     HomeAssistant,
+    callback,
     ServiceCall,
     ServiceResponse,
     SupportsResponse,
@@ -24,6 +27,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.service import async_register_platform_entity_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -41,6 +45,7 @@ from .const import (
     ANYLIST_DEFAULT_POLL_INTERVAL,
     ANYLIST_MAX_POLL_INTERVAL,
     ANYLIST_MIN_POLL_INTERVAL,
+    REALTIME_BACKSTOP_INTERVAL,
     ANYLIST_PHOTO_TIMEOUT,
     ANYLIST_REFRESH_TIMEOUT,
     ANYLIST_REQUEST_TIMEOUT,
@@ -1257,7 +1262,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_update_data() -> dict[str, Any]:
         """Fetch data from AnyList."""
-        return await _async_fetch_data(hass, client)
+        try:
+            return await _async_fetch_data(hass, client)
+        except UpdateFailed as err:
+            # While realtime is up the timer runs hourly; retry a failure at
+            # the configured interval instead (a 429 keeps its own cooldown).
+            if (
+                err.retry_after is None
+                and coordinator.update_interval != timedelta(seconds=poll_interval)
+            ):
+                err.retry_after = poll_interval
+            raise
 
     poll_interval = get_poll_interval(entry)
     coordinator = DataUpdateCoordinator(
@@ -1294,8 +1309,58 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Realtime push: AnyList tells its apps over a WebSocket when anything
-    # changes; refresh then, instead of waiting for the next poll. Polling
-    # stays on as the fallback whenever the socket is down.
+    # changes; refresh then, instead of waiting for the next poll. While the
+    # socket is up, polling drops to an hourly backstop; when it goes down,
+    # the configured interval returns, with the next poll one interval later.
+    # (The reconnect itself refreshes, so a drop needs no immediate poll.)
+    poll_delta = timedelta(seconds=poll_interval)
+    backstop_delta = timedelta(seconds=max(poll_interval, REALTIME_BACKSTOP_INTERVAL))
+    resume_poll: Callable[[], None] | None = None
+
+    def _cancel_resume() -> None:
+        nonlocal resume_poll
+        if resume_poll is not None:
+            resume_poll()
+            resume_poll = None
+
+    @callback
+    def _async_resume_poll(_now: datetime) -> None:
+        nonlocal resume_poll
+        resume_poll = None
+        # The refresh reschedules the coordinator at the restored interval,
+        # replacing the hourly timer that was pending.
+        entry.async_create_task(
+            hass, coordinator.async_request_refresh(), "anylist resume polling"
+        )
+
+    @callback
+    def _async_realtime_connected(connected: bool) -> None:
+        nonlocal resume_poll
+        _cancel_resume()
+        if connected:
+            coordinator.update_interval = backstop_delta
+            _LOGGER.debug(
+                "AnyList realtime up: polling every %s seconds as a backstop",
+                backstop_delta.total_seconds(),
+            )
+        else:
+            coordinator.update_interval = poll_delta
+            if not entry.pref_disable_polling:
+                resume_poll = async_call_later(
+                    hass,
+                    poll_interval,
+                    HassJob(
+                        _async_resume_poll,
+                        "anylist resume polling",
+                        cancel_on_shutdown=True,
+                    ),
+                )
+            _LOGGER.debug(
+                "AnyList realtime down: polling every %s seconds", poll_interval
+            )
+
+    entry.async_on_unload(_cancel_resume)
+
     async def _async_realtime_refresh(resources: frozenset[str], refresh: bool) -> None:
         await hass.async_add_executor_job(client.mark_stale, resources)
         if refresh:
@@ -1303,7 +1368,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_request_refresh()
 
     realtime = AnyListRealtime(
-        hass, client, async_get_clientsession(hass), _async_realtime_refresh
+        hass,
+        client,
+        async_get_clientsession(hass),
+        _async_realtime_refresh,
+        _async_realtime_connected,
     )
     entry.runtime_data.realtime = realtime
     realtime.start()
