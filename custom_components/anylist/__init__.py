@@ -1296,9 +1296,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Realtime push: AnyList tells its apps over a WebSocket when anything
     # changes; refresh then, instead of waiting for the next poll. Polling
     # stays on as the fallback whenever the socket is down.
-    async def _async_realtime_refresh() -> None:
-        await hass.async_add_executor_job(client.request_refresh)
-        await coordinator.async_request_refresh()
+    async def _async_realtime_refresh(resources: frozenset[str], refresh: bool) -> None:
+        await hass.async_add_executor_job(client.mark_stale, resources)
+        if refresh:
+            # Debounced: a burst of pushes costs at most one refresh per cooldown.
+            await coordinator.async_request_refresh()
 
     realtime = AnyListRealtime(
         hass, client, async_get_clientsession(hass), _async_realtime_refresh
@@ -1362,6 +1364,10 @@ async def async_remove_config_entry_device(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     platforms = get_platforms(entry)
+    # Stop the realtime listener first, so no push refresh reaches the client
+    # after it's closed below.
+    if (runtime := getattr(entry, "runtime_data", None)) is not None and runtime.realtime is not None:
+        await runtime.realtime.stop()
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
         runtime = entry.runtime_data
         runtime.client.close()
