@@ -374,3 +374,13 @@ def fake_recipe() -> FakeRecipe:
         ingredients=[SimpleNamespace(name="Pasta", quantity="1 box", note=None, raw_ingredient=None)],
         preparation_steps=["Boil water"],
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_realtime_socket(request, monkeypatch):
+    """Integration tests never open AnyList's realtime WebSocket."""
+    if request.node.module.__name__.endswith("test_realtime"):
+        return
+    from custom_components.anylist import realtime
+
+    monkeypatch.setattr(realtime.AnyListRealtime, "start", lambda self: None)

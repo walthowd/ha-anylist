@@ -23,6 +23,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
 )
 from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.service import async_register_platform_entity_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -99,6 +100,7 @@ from .recipe_search import (
     normalize_search_text,
     search_recipes,
 )
+from .realtime import AnyListRealtime
 from .sync_storage import (
     AnyListSyncStore,
     async_create_client,
@@ -119,6 +121,7 @@ class AnyListRuntimeData:
     coordinator: DataUpdateCoordinator[dict[str, Any]]
     icalendar_url: str | None
     sync_store: AnyListSyncStore | None = None
+    realtime: AnyListRealtime | None = None
 
 
 _INGREDIENT_ONLY_FIELDS = (ATTR_QUANTITY, ATTR_NOTE, ATTR_RAW_INGREDIENT)
@@ -1290,6 +1293,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         poll_interval,
     )
 
+    # Realtime push: AnyList tells its apps over a WebSocket when anything
+    # changes; refresh then, instead of waiting for the next poll. Polling
+    # stays on as the fallback whenever the socket is down.
+    async def _async_realtime_refresh(resources: frozenset[str], refresh: bool) -> None:
+        await hass.async_add_executor_job(client.mark_stale, resources)
+        if refresh:
+            # Debounced: a burst of pushes costs at most one refresh per cooldown.
+            await coordinator.async_request_refresh()
+
+    realtime = AnyListRealtime(
+        hass, client, async_get_clientsession(hass), _async_realtime_refresh
+    )
+    entry.runtime_data.realtime = realtime
+    realtime.start()
+    entry.async_on_unload(realtime.stop)
+
     return True
 
 
@@ -1345,6 +1364,10 @@ async def async_remove_config_entry_device(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     platforms = get_platforms(entry)
+    # Stop the realtime listener first, so no push refresh reaches the client
+    # after it's closed below.
+    if (runtime := getattr(entry, "runtime_data", None)) is not None and runtime.realtime is not None:
+        await runtime.realtime.stop()
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
         runtime = entry.runtime_data
         runtime.client.close()

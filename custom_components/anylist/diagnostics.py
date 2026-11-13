@@ -76,6 +76,9 @@ async def async_get_config_entry_diagnostics(
             ),
             "poll_interval": get_poll_interval(entry),
             "sync": runtime_data.client.sync_diagnostics() if runtime_data is not None else {},
+            "realtime": runtime_data.realtime.diagnostics()
+            if runtime_data is not None and runtime_data.realtime is not None
+            else {},
         },
     }
 
